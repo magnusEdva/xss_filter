@@ -27,10 +27,12 @@
 #include "nsJSUtils.h"
 #include "mozilla/dom/DocGroup.h"
 #include "mozilla/dom/Element.h"
+#include "mozilla/dom/ScriptDecoding.h"  // mozilla::dom::ScriptDecoding
 #include "mozilla/dom/ScriptSettings.h"
 #include "mozilla/dom/SRILogHelper.h"
 #include "mozilla/net/UrlClassifierFeatureFactory.h"
-#include "mozilla/StaticPrefs.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_network.h"
 #include "nsAboutProtocolUtils.h"
 #include "nsGkAtoms.h"
 #include "nsNetUtil.h"
@@ -344,23 +346,19 @@ nsresult ScriptLoader::CheckContentPolicy(Document* aDocument,
 
 /* static */
 bool ScriptLoader::IsAboutPageLoadingChromeURI(ScriptLoadRequest* aRequest) {
-  // if we are not dealing with a codebasePrincipal it can not be a
+  // if we are not dealing with a contentPrincipal it can not be a
   // Principal with a scheme of about: and there is nothing left to do
-  if (!aRequest->TriggeringPrincipal()->GetIsCodebasePrincipal()) {
+  if (!aRequest->TriggeringPrincipal()->GetIsContentPrincipal()) {
     return false;
   }
-
+  if (!aRequest->TriggeringPrincipal()->SchemeIs("about")) {
+    return false;
+  }
   // if the triggering uri is not of scheme about:, there is nothing to do
   nsCOMPtr<nsIURI> triggeringURI;
   nsresult rv =
       aRequest->TriggeringPrincipal()->GetURI(getter_AddRefs(triggeringURI));
   NS_ENSURE_SUCCESS(rv, false);
-
-  bool isAbout =
-      (NS_SUCCEEDED(triggeringURI->SchemeIs("about", &isAbout)) && isAbout);
-  if (!isAbout) {
-    return false;
-  }
 
   // if the about: page is linkable from content, there is nothing to do
   nsCOMPtr<nsIAboutModule> aboutMod;
@@ -376,9 +374,7 @@ bool ScriptLoader::IsAboutPageLoadingChromeURI(ScriptLoadRequest* aRequest) {
   }
 
   // if the uri to be loaded is not of scheme chrome:, there is nothing to do.
-  bool isChrome =
-      (NS_SUCCEEDED(aRequest->mURI->SchemeIs("chrome", &isChrome)) && isChrome);
-  if (!isChrome) {
+  if (!aRequest->mURI->SchemeIs("chrome")) {
     return false;
   }
 
@@ -541,6 +537,15 @@ nsresult ScriptLoader::CreateModuleScript(ModuleLoadRequest* aRequest) {
         MaybeSourceText maybeSource;
         rv = GetScriptSource(cx, aRequest, &maybeSource);
         if (NS_SUCCEEDED(rv)) {
+          nsCString source;
+                  if(maybeSource.constructed<SourceText<char16_t>>()){
+                     source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
+                  } else {
+                     source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
+                  }
+                  bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
+                  printf("ResolveRequestedModules is %s", isSafe ? "not injected\n" : "injected\n");
+                  if(isSafe){
           rv = maybeSource.constructed<SourceText<char16_t>>()
                    ? nsJSUtils::CompileModule(
                          cx, maybeSource.ref<SourceText<char16_t>>(), global,
@@ -548,6 +553,7 @@ nsresult ScriptLoader::CreateModuleScript(ModuleLoadRequest* aRequest) {
                    : nsJSUtils::CompileModule(
                          cx, maybeSource.ref<SourceText<Utf8Unit>>(), global,
                          options, &module);
+                  }
         }
       }
     }
@@ -1340,11 +1346,19 @@ nsresult ScriptLoader::StartLoad(ScriptLoadRequest* aRequest) {
     }
   }
 
+  nsCOMPtr<nsIScriptGlobalObject> globalObject = GetScriptGlobalObject();
+  if (!globalObject) {
+    return NS_ERROR_FAILURE;
+  }
+
   // To avoid decoding issues, the build-id is part of the JSBytecodeMimeType
   // constant.
   aRequest->mCacheInfo = nullptr;
   nsCOMPtr<nsICacheInfoChannel> cic(do_QueryInterface(channel));
   if (cic && StaticPrefs::dom_script_loader_bytecode_cache_enabled() &&
+      // Globals with instrumentation have modified script bytecode and can't
+      // use cached bytecode.
+      !js::GlobalHasInstrumentation(globalObject->GetGlobalJSObject()) &&
       // Bug 1436400: no bytecode cache support for modules yet.
       !aRequest->IsModuleRequest()) {
     if (!aRequest->IsLoadingSource()) {
@@ -1503,8 +1517,7 @@ static bool CSPAllowsInlineScript(nsIScriptElement* aElement,
 ScriptLoadRequest* ScriptLoader::CreateLoadRequest(
     ScriptKind aKind, nsIURI* aURI, nsIScriptElement* aElement,
     nsIPrincipal* aTriggeringPrincipal, CORSMode aCORSMode,
-    const SRIMetadata& aIntegrity,
-    mozilla::net::ReferrerPolicy aReferrerPolicy) {
+    const SRIMetadata& aIntegrity, ReferrerPolicy aReferrerPolicy) {
   nsIURI* referrer = mDocument->GetDocumentURIAsReferrer();
   ScriptFetchOptions* fetchOptions = new ScriptFetchOptions(
       aCORSMode, aReferrerPolicy, aElement, aTriggeringPrincipal);
@@ -1613,12 +1626,14 @@ bool ScriptLoader::ProcessExternalScript(nsIScriptElement* aElement,
     AccumulateCategorical(LABELS_DOM_SCRIPT_PRELOAD_RESULT::RejectedByPolicy);
     return false;
   }
-  if(mDocument){
+
+    if(mDocument){
   //-------------- XSS Filter ---------------
     if (!mDocument->xssFilter->StartFilterExternalScript(scriptURI)) {
       return false;
     }
   }
+
   if (request) {
     // Use the preload request.
 
@@ -1648,7 +1663,7 @@ bool ScriptLoader::ProcessExternalScript(nsIScriptElement* aElement,
     }
 
     CORSMode ourCORSMode = aElement->GetCORSMode();
-    mozilla::net::ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
+    ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
 
     request = CreateLoadRequest(aScriptKind, scriptURI, aElement, principal,
                                 ourCORSMode, sriMetadata, referrerPolicy);
@@ -1786,7 +1801,7 @@ bool ScriptLoader::ProcessInlineScript(nsIScriptElement* aElement,
     corsMode = aElement->GetCORSMode();
   }
 
-  mozilla::net::ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
+  ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
   RefPtr<ScriptLoadRequest> request =
       CreateLoadRequest(aScriptKind, mDocument->GetDocumentURI(), aElement,
                         mDocument->NodePrincipal(), corsMode,
@@ -1887,7 +1902,7 @@ ScriptLoadRequest* ScriptLoader::LookupPreloadRequest(
   // we have now.
   nsAutoString elementCharset;
   aElement->GetScriptCharset(elementCharset);
-  mozilla::net::ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
+  ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
 
   if (!elementCharset.Equals(preloadCharset) ||
       aElement->GetCORSMode() != request->CORSMode() ||
@@ -1925,11 +1940,9 @@ void ScriptLoader::GetSRIMetadata(const nsAString& aIntegrityAttr,
                               aMetadataOut);
 }
 
-mozilla::net::ReferrerPolicy ScriptLoader::GetReferrerPolicy(
-    nsIScriptElement* aElement) {
-  mozilla::net::ReferrerPolicy scriptReferrerPolicy =
-      aElement->GetReferrerPolicy();
-  if (scriptReferrerPolicy != mozilla::net::RP_Unset) {
+ReferrerPolicy ScriptLoader::GetReferrerPolicy(nsIScriptElement* aElement) {
+  ReferrerPolicy scriptReferrerPolicy = aElement->GetReferrerPolicy();
+  if (scriptReferrerPolicy != ReferrerPolicy::_empty) {
     return scriptReferrerPolicy;
   }
   return mDocument->GetReferrerPolicy();
@@ -2102,16 +2115,25 @@ nsresult ScriptLoader::AttemptAsyncScriptCompile(ScriptLoadRequest* aRequest,
     MaybeSourceText maybeSource;
     nsresult rv = GetScriptSource(cx, aRequest, &maybeSource);
     NS_ENSURE_SUCCESS(rv, rv);
-
-    if (maybeSource.constructed<SourceText<char16_t>>()
-            ? !JS::CompileOffThreadModule(
-                  cx, options, maybeSource.ref<SourceText<char16_t>>(),
-                  OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
-            : !JS::CompileOffThreadModule(
-                  cx, options, maybeSource.ref<SourceText<Utf8Unit>>(),
-                  OffThreadScriptLoaderCallback,
-                  static_cast<void*>(runnable))) {
-      return NS_ERROR_OUT_OF_MEMORY;
+    nsCString source;
+    if(maybeSource.constructed<SourceText<char16_t>>()){
+      source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
+    } else {
+      source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
+    }
+    bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
+    printf("CompileOffThreadModule() is %s", isSafe ? "not injected\n" : "injected\n");
+    if(isSafe){
+      if (maybeSource.constructed<SourceText<char16_t>>()
+              ? !JS::CompileOffThreadModule(
+                    cx, options, maybeSource.ref<SourceText<char16_t>>(),
+                    OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
+              : !JS::CompileOffThreadModule(
+                    cx, options, maybeSource.ref<SourceText<Utf8Unit>>(),
+                    OffThreadScriptLoaderCallback,
+                    static_cast<void*>(runnable))) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
     }
   } else if (aRequest->IsBytecode()) {
     if (!JS::DecodeOffThreadScript(
@@ -2134,16 +2156,25 @@ nsresult ScriptLoader::AttemptAsyncScriptCompile(ScriptLoadRequest* aRequest,
     MaybeSourceText maybeSource;
     nsresult rv = GetScriptSource(cx, aRequest, &maybeSource);
     NS_ENSURE_SUCCESS(rv, rv);
-
-    if (maybeSource.constructed<SourceText<char16_t>>()
-            ? !JS::CompileOffThread(
-                  cx, options, maybeSource.ref<SourceText<char16_t>>(),
-                  OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
-            : !JS::CompileOffThread(cx, options,
-                                    maybeSource.ref<SourceText<Utf8Unit>>(),
-                                    OffThreadScriptLoaderCallback,
-                                    static_cast<void*>(runnable))) {
-      return NS_ERROR_OUT_OF_MEMORY;
+    nsCString source;
+    if(maybeSource.constructed<SourceText<char16_t>>()){
+      source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
+    } else {
+      source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
+    }
+    bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
+    printf("CompileOffThread() is %s", isSafe ? "not injected\n" : "injected\n");
+    if(isSafe){
+      if (maybeSource.constructed<SourceText<char16_t>>()
+              ? !JS::CompileOffThread(
+                    cx, options, maybeSource.ref<SourceText<char16_t>>(),
+                    OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
+              : !JS::CompileOffThread(cx, options,
+                                      maybeSource.ref<SourceText<Utf8Unit>>(),
+                                      OffThreadScriptLoaderCallback,
+                                      static_cast<void*>(runnable))) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
     }
   }
 
@@ -2250,7 +2281,6 @@ nsresult ScriptLoader::ProcessRequest(ScriptLoadRequest* aRequest) {
                "Processing requests when running scripts is unsafe.");
   NS_ASSERTION(aRequest->IsReadyToRun(),
                "Processing a request that is not ready to run.");
-
   NS_ENSURE_ARG(aRequest);
 
   if (aRequest->IsModuleRequest()) {
@@ -2574,6 +2604,29 @@ class MOZ_RAII AutoSetProcessingScriptTag {
   ~AutoSetProcessingScriptTag() { mContext->SetProcessingScriptTag(mOldTag); }
 };
 
+static void ReportStreamAndParseTelemetry(JS::Handle<JSScript*> aScript,
+                                          TimeDuration aStreamingTime) {
+  using namespace mozilla::Telemetry;
+  if (!aStreamingTime) {
+    Accumulate(DOM_SCRIPT_IS_STREAMED, false);
+    return;
+  }
+  Accumulate(DOM_SCRIPT_IS_STREAMED, true);
+  TimeDuration parseTime;
+  TimeDuration emitTime;
+  JS_ReportFirstCompileTime(aScript, parseTime, emitTime);
+
+  double st = aStreamingTime.ToMilliseconds();
+  double pt = parseTime.ToMilliseconds();
+  double et = emitTime.ToMilliseconds();
+  double total = st + pt + et;
+  double spt = st + std::max(pt - st, double(0)) + et;
+  Accumulate(DOM_SCRIPT_LOAD_STREAM_TIME_PERCENT, 100 * st / total);
+  Accumulate(DOM_SCRIPT_LOAD_PARSE_TIME_PERCENT, 100 * pt / total);
+  Accumulate(DOM_SCRIPT_LOAD_EMIT_TIME_PERCENT, 100 * et / total);
+  Accumulate(DOM_SCRIPT_LOAD_STREAMPARSE_ESTIMATE_PERCENT, 100 * spt / total);
+}
+
 static nsresult ExecuteCompiledScript(JSContext* aCx,
                                       ScriptLoadRequest* aRequest,
                                       nsJSUtils::ExecutionContext& aExec) {
@@ -2583,6 +2636,11 @@ static nsresult ExecuteCompiledScript(JSContext* aCx,
     // disabled for the global.
     return NS_OK;
   }
+
+  // Report telemetry about streaming, parsing and emitting code for the given
+  // script. These telemetry are used to analyze whether it would be beneficial
+  // to use a streaming parser.
+  ReportStreamAndParseTelemetry(script, aRequest->mStreamingTime);
 
   // Create a ClassicScript object and associate it with the JSScript.
   RefPtr<ClassicScript> classicScript =
@@ -2643,7 +2701,6 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
   if (!mDocument) {
     return NS_ERROR_FAILURE;
   }
-
   bool isDynamicImport = aRequest->IsModuleRequest() &&
                          aRequest->AsModuleRequest()->IsDynamicImport();
   if (!isDynamicImport) {
@@ -2689,7 +2746,7 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
 
   nsresult rv;
   {
-    if (false) {
+    if (aRequest->IsModuleRequest()) {
       // When a module is already loaded, it is not feched a second time and the
       // mDataType of the request might remain set to DataType::Unknown.
       MOZ_ASSERT(aRequest->IsTextSource() || aRequest->IsUnknownDataType());
@@ -2723,8 +2780,6 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
       rv = InitDebuggerDataForModuleTree(cx, request);
       NS_ENSURE_SUCCESS(rv, rv);
 
-      printf("her har vi et problem \n");
-
       rv = nsJSUtils::ModuleEvaluate(cx, module);
       MOZ_ASSERT(NS_FAILED(rv) == aes.HasException());
 
@@ -2746,7 +2801,7 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
 
       JS::CompileOptions options(cx);
       rv = FillCompileOptionsForRequest(aes, aRequest, global, &options);
-      bool isSafe = false;
+      bool isSafe;
       if (NS_SUCCEEDED(rv)) {
         if (aRequest->IsBytecode()) {
           TRACE_FOR_TEST(aRequest->Element(), "scriptloader_execute");
@@ -2763,7 +2818,6 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
           }
 
           if (rv == NS_OK) {
-            printf("her har vi et problem \n");
             rv = ExecuteCompiledScript(cx, aRequest, exec);
           }
 
@@ -2803,7 +2857,6 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
                 MaybeSourceText maybeSource;
                 rv = GetScriptSource(cx, aRequest, &maybeSource);
                 if (NS_SUCCEEDED(rv)) {
-                // -------------- XSS Filter ---------------
                   nsCString source;
                   if(maybeSource.constructed<SourceText<char16_t>>()){
                      source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
@@ -2811,16 +2864,16 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
                      source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
                   }
                   isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
-                  printf("xssfilter is %s", isSafe ? "not injected\n" : "injected\n");
-                if (isSafe) {
-                  rv = maybeSource.constructed<SourceText<char16_t>>()
+                  printf("EvaluateScript() is %s", isSafe ? "not injected\n" : "injected\n");
+                  if(isSafe){
+                    rv = maybeSource.constructed<SourceText<char16_t>>()
                            ? exec.Compile(
                                  options,
                                  maybeSource.ref<SourceText<char16_t>>())
                            : exec.Compile(
                                  options,
                                  maybeSource.ref<SourceText<Utf8Unit>>());
-                }
+                  }
                 }
               }
             }
@@ -2832,7 +2885,7 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
           }
 
           // Queue the current script load request to later save the bytecode.
-          if (false) {
+          if (script && encodeBytecode) {
             aRequest->SetScript(script);
             TRACE_FOR_TEST(aRequest->Element(), "scriptloader_encode");
             MOZ_ASSERT(aRequest->mBytecodeOffset ==
@@ -3156,7 +3209,8 @@ bool ScriptLoader::ReadyToExecuteParserBlockingScripts() {
     return false;
   }
 
-  for (Document* doc = mDocument; doc; doc = doc->GetParentDocument()) {
+  for (Document* doc = mDocument; doc;
+       doc = doc->GetInProcessParentDocument()) {
     ScriptLoader* ancestor = doc->ScriptLoader();
     if (!ancestor->SelfReadyToExecuteParserBlockingScripts() &&
         ancestor->AddPendingChildLoader(this)) {
@@ -3167,67 +3221,6 @@ bool ScriptLoader::ReadyToExecuteParserBlockingScripts() {
 
   return true;
 }
-
-template <typename Unit>
-struct Conversion;
-
-template <>
-struct Conversion<char16_t> {
-  static CheckedInt<size_t> MaxBufferLength(
-      const UniquePtr<Decoder>& aUnicodeDecoder, size_t aByteLength) {
-    return aUnicodeDecoder->MaxUTF16BufferLength(aByteLength);
-  }
-
-  static size_t DecodeInto(const UniquePtr<Decoder>& aUnicodeDecoder,
-                           const Span<const uint8_t>& aData, char16_t* aDest,
-                           size_t aDestLength) {
-    uint32_t result;
-    size_t read;
-    size_t written;
-    bool hadErrors;
-    Tie(result, read, written, hadErrors) = aUnicodeDecoder->DecodeToUTF16(
-        aData, MakeSpan(aDest, aDestLength), true);
-    MOZ_ASSERT(result == kInputEmpty);
-    MOZ_ASSERT(read == aData.Length());
-    MOZ_ASSERT(written <= aDestLength);
-    Unused << hadErrors;
-
-    return written;
-  }
-};
-
-template <>
-struct Conversion<Utf8Unit> {
-  static CheckedInt<size_t> MaxBufferLength(
-      const UniquePtr<Decoder>& aUnicodeDecoder, size_t aByteLength) {
-    return aUnicodeDecoder->MaxUTF8BufferLength(aByteLength);
-  }
-
-  static size_t DecodeInto(const UniquePtr<Decoder>& aUnicodeDecoder,
-                           const Span<const uint8_t>& aData, Utf8Unit* aDest,
-                           size_t aDestLength) {
-    uint32_t result;
-    size_t read;
-    size_t written;
-    bool hadErrors;
-    // Until C++ char8_t happens, our decoder APIs deal in |uint8_t| while
-    // |Utf8Unit| internally deals with |char|, so there's inevitable impedance
-    // mismatch.  :-(  The written memory will be interpreted through
-    // |char Utf8Unit::mValue| which is *permissible* because any object's
-    // memory can be interpreted as |char|.  Unfortunately, until
-    // twos-complement is mandated, we have to play fast and loose and *hope*
-    // interpreting memory storing |uint8_t| as |char| will pick up the desired
-    // wrapped-around value.  ¯\_(ツ)_/¯
-    Tie(result, read, written, hadErrors) = aUnicodeDecoder->DecodeToUTF8(
-        aData, MakeSpan(reinterpret_cast<uint8_t*>(aDest), aDestLength), true);
-    MOZ_ASSERT(result == kInputEmpty);
-    MOZ_ASSERT(read == aData.Length());
-    MOZ_ASSERT(written <= aDestLength);
-    Unused << hadErrors;
-
-    return written;
-  }
-};
 
 template <typename Unit>
 static nsresult ConvertToUnicode(nsIChannel* aChannel, const uint8_t* aData,
@@ -3288,7 +3281,7 @@ static nsresult ConvertToUnicode(nsIChannel* aChannel, const uint8_t* aData,
   });
 
   CheckedInt<size_t> bufferLength =
-      Conversion<Unit>::MaxBufferLength(unicodeDecoder, aLength);
+      ScriptDecoding<Unit>::MaxBufferLength(unicodeDecoder, aLength);
   if (!bufferLength.isValid()) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
@@ -3304,8 +3297,9 @@ static nsresult ConvertToUnicode(nsIChannel* aChannel, const uint8_t* aData,
   }
 
   signalOOM.release();
-  aLengthOut = Conversion<Unit>::DecodeInto(unicodeDecoder, data, aBufOut,
-                                            bufferLength.value());
+  aLengthOut = ScriptDecoding<Unit>::DecodeInto(
+      unicodeDecoder, data, MakeSpan(aBufOut, bufferLength.value()),
+      /* aEndOfSource = */ true);
   return NS_OK;
 }
 
@@ -3605,22 +3599,8 @@ uint32_t ScriptLoader::NumberOfProcessors() {
 }
 
 static bool IsInternalURIScheme(nsIURI* uri) {
-  bool isWebExt;
-  if (NS_SUCCEEDED(uri->SchemeIs("moz-extension", &isWebExt)) && isWebExt) {
-    return true;
-  }
-
-  bool isResource;
-  if (NS_SUCCEEDED(uri->SchemeIs("resource", &isResource)) && isResource) {
-    return true;
-  }
-
-  bool isChrome;
-  if (NS_SUCCEEDED(uri->SchemeIs("chrome", &isChrome)) && isChrome) {
-    return true;
-  }
-
-  return false;
+  return uri->SchemeIs("moz-extension") || uri->SchemeIs("resource") ||
+         uri->SchemeIs("chrome");
 }
 
 nsresult ScriptLoader::PrepareLoadedRequest(ScriptLoadRequest* aRequest,
@@ -3785,11 +3765,12 @@ void ScriptLoader::ParsingComplete(bool aTerminated) {
   ProcessPendingRequests();
 }
 
-void ScriptLoader::PreloadURI(
-    nsIURI* aURI, const nsAString& aCharset, const nsAString& aType,
-    const nsAString& aCrossOrigin, const nsAString& aIntegrity,
-    bool aScriptFromHead, bool aAsync, bool aDefer, bool aNoModule,
-    const mozilla::net::ReferrerPolicy aReferrerPolicy) {
+void ScriptLoader::PreloadURI(nsIURI* aURI, const nsAString& aCharset,
+                              const nsAString& aType,
+                              const nsAString& aCrossOrigin,
+                              const nsAString& aIntegrity, bool aScriptFromHead,
+                              bool aAsync, bool aDefer, bool aNoModule,
+                              const ReferrerPolicy aReferrerPolicy) {
   NS_ENSURE_TRUE_VOID(mDocument);
   // Check to see if scripts has been turned off.
   if (!mEnabled || !mDocument->IsScriptEnabled()) {

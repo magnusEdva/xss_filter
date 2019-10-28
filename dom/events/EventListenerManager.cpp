@@ -19,6 +19,7 @@
 #include "mozilla/MemoryReporting.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_full_screen_api.h"
 #include "mozilla/dom/BindingUtils.h"
 #include "mozilla/dom/EventCallbackDebuggerNotification.h"
 #include "mozilla/dom/Element.h"
@@ -29,6 +30,7 @@
 #include "mozilla/dom/ScriptLoader.h"
 #include "mozilla/dom/ScriptSettings.h"
 #include "mozilla/dom/TouchEvent.h"
+#include "mozilla/dom/UserActivation.h"
 #include "mozilla/TimelineConsumers.h"
 #include "mozilla/EventTimelineMarker.h"
 #include "mozilla/TimeStamp.h"
@@ -55,7 +57,6 @@
 #include "nsIFrame.h"
 #include "nsDisplayList.h"
 #include "mozilla/dom/XSSFilter.h"
-
 
 namespace mozilla {
 
@@ -275,7 +276,9 @@ void EventListenerManager::AddEventListenerInternal(
     // Go from our target to the nearest enclosing DOM window.
     if (nsPIDOMWindowInner* window = GetInnerWindowForTarget()) {
       nsCOMPtr<Document> doc = window->GetExtantDoc();
-      if (doc) {
+      if (doc &&
+          !(aFlags.mInSystemGroup &&
+            doc->DontWarnAboutMutationEventsAndAllowSlowDOMMutations())) {
         doc->WarnOnceAbout(Document::eMutationEvent);
       }
       // If aEventMessage is eLegacySubtreeModified, we need to listen all
@@ -366,23 +369,20 @@ void EventListenerManager::AddEventListenerInternal(
     }
   } else if (aTypeAtom == nsGkAtoms::onstart) {
     if (nsPIDOMWindowInner* window = GetInnerWindowForTarget()) {
-      nsCOMPtr<Document> doc = window->GetExtantDoc();
-      if (doc) {
-        doc->SetDocumentAndPageUseCounter(eUseCounter_custom_onstart);
+      if (Document* doc = window->GetExtantDoc()) {
+        doc->SetUseCounter(eUseCounter_custom_onstart);
       }
     }
   } else if (aTypeAtom == nsGkAtoms::onbounce) {
     if (nsPIDOMWindowInner* window = GetInnerWindowForTarget()) {
-      nsCOMPtr<Document> doc = window->GetExtantDoc();
-      if (doc) {
-        doc->SetDocumentAndPageUseCounter(eUseCounter_custom_onbounce);
+      if (Document* doc = window->GetExtantDoc()) {
+        doc->SetUseCounter(eUseCounter_custom_onbounce);
       }
     }
   } else if (aTypeAtom == nsGkAtoms::onfinish) {
     if (nsPIDOMWindowInner* window = GetInnerWindowForTarget()) {
-      nsCOMPtr<Document> doc = window->GetExtantDoc();
-      if (doc) {
-        doc->SetDocumentAndPageUseCounter(eUseCounter_custom_onfinish);
+      if (Document* doc = window->GetExtantDoc()) {
+        doc->SetUseCounter(eUseCounter_custom_onfinish);
       }
     }
   } else if (aTypeAtom == nsGkAtoms::ontext) {
@@ -650,6 +650,22 @@ static bool DefaultToPassiveTouchListeners() {
   return sDefaultToPassiveTouchListeners;
 }
 
+void EventListenerManager::MaybeMarkPassive(EventMessage aMessage,
+                                            EventListenerFlags& aFlags) {
+  if ((aMessage == eTouchStart || aMessage == eTouchMove) && mIsMainThreadELM &&
+      DefaultToPassiveTouchListeners()) {
+    nsCOMPtr<nsINode> node;
+    nsCOMPtr<nsPIDOMWindowInner> win;
+    if ((win = GetTargetAsInnerWindow()) ||
+        ((node = do_QueryInterface(mTarget)) &&
+         (node == node->OwnerDoc() ||
+          node == node->OwnerDoc()->GetRootElement() ||
+          node == node->OwnerDoc()->GetBody()))) {
+      aFlags.mPassive = true;
+    }
+  }
+}
+
 void EventListenerManager::AddEventListenerByType(
     EventListenerHolder aListenerHolder, const nsAString& aType,
     const EventListenerFlags& aFlags, const Optional<bool>& aPassive) {
@@ -660,17 +676,8 @@ void EventListenerManager::AddEventListenerByType(
   EventListenerFlags flags = aFlags;
   if (aPassive.WasPassed()) {
     flags.mPassive = aPassive.Value();
-  } else if ((message == eTouchStart || message == eTouchMove) &&
-             mIsMainThreadELM && DefaultToPassiveTouchListeners()) {
-    nsCOMPtr<nsINode> node;
-    nsCOMPtr<nsPIDOMWindowInner> win;
-    if ((win = GetTargetAsInnerWindow()) ||
-        ((node = do_QueryInterface(mTarget)) &&
-         (node == node->OwnerDoc() ||
-          node == node->OwnerDoc()->GetRootElement() ||
-          node == node->OwnerDoc()->GetBody()))) {
-      flags.mPassive = true;
-    }
+  } else {
+    MaybeMarkPassive(message, flags);
   }
 
   AddEventListenerInternal(std::move(aListenerHolder), message, atom, flags);
@@ -715,6 +722,7 @@ EventListenerManager::Listener* EventListenerManager::SetEventHandlerInternal(
     // create and add a new one.
     EventListenerFlags flags;
     flags.mListenerIsJSListener = true;
+    MaybeMarkPassive(eventMessage, flags);
 
     nsCOMPtr<JSEventHandler> jsEventHandler;
     NS_NewJSEventHandler(mTarget, aName, aTypedHandler,
@@ -963,20 +971,21 @@ nsresult EventListenerManager::CompileEventHandlerInternal(
     return NS_ERROR_FAILURE;
   }
   JS::CompileOptions options(cx);
-  XSSFilter* xssFilter = new XSSFilter();//doc->xssFilter;
-  xssFilter->FetchRequestData(doc);
-  nsAutoString html;
-  aElement->GetOuterHTML(html);
-  printf("eventlistenermanager fetched requestdata %s \n", NS_ConvertUTF16toUTF8(html).get());
-  if (!xssFilter->StartFilterEventHandlerScript(html)) {
-    return NS_OK;
-  }
   // Use line 0 to make the function body starts from line 1.
   options.setIntroductionType("eventHandler")
       .setFileAndLine(url.get(), 0)
       .setElement(&v.toObject())
       .setElementAttributeName(jsStr);
 
+  XSSFilter* xssFilter = new XSSFilter();//doc->xssFilter;
+  xssFilter->FetchRequestData(doc);
+  nsAutoString html;
+  aElement->GetOuterHTML(html);
+  if (!xssFilter->StartFilterEventHandlerScript(html)) {
+      printf("eventlistenermanager injected %s \n", NS_ConvertUTF16toUTF8(html).get());
+
+    return NS_OK;
+  }
   JS::Rooted<JSObject*> handler(cx);
   result = nsJSUtils::CompileFunction(jsapi, scopeChain, options,
                                       nsAtomCString(typeAtom), argCount,
@@ -1137,8 +1146,8 @@ void EventListenerManager::HandleEventInternal(nsPresContext* aPresContext,
   Maybe<AutoHandlingUserInputStatePusher> userInputStatePusher;
   Maybe<AutoPopupStatePusher> popupStatePusher;
   if (mIsMainThreadELM) {
-    userInputStatePusher.emplace(
-        EventStateManager::IsUserInteractionEvent(aEvent), aEvent);
+    userInputStatePusher.emplace(UserActivation::IsUserInteractionEvent(aEvent),
+                                 aEvent);
     popupStatePusher.emplace(
         PopupBlocker::GetEventPopupControlState(aEvent, *aDOMEvent));
   }
