@@ -27,82 +27,17 @@ namespace dom {
 //////////////////////////////////////////////////////////////
 
 class XSSFilter {
-
-private:
-  Document* mDocument;
-  nsAutoCString srcFromRequest;
-  std::map <nsAutoCString, nsAutoCString> postParams;
-  URLParams urlGetParams, urlPostParams, externalSrcURL;
-  bool isPostParamSet = false, isGetParamSet = false;
-
 public:
   XSSFilter();
+  bool StartFilter(const nsAString& script, ScriptLoadRequest* request);
+  bool StartFilter(const nsAString& script, const nsAString& url);
+  bool StartFilter(nsCOMPtr<nsIURI> scriptURI);
 
-  void FetchRequestData(Document* aDocument);
-
-  bool isInjected(nsCString reqParam, nsCString mScriptContent);
-
-  bool isInjectedExternal(nsCString reqParam, nsCString externalScriptURI);
-
+private:
+  bool isInjected(const nsAString& reqParam, const nsAString& mScriptContent);
+  nsresult GetGETData(const nsACString& URL, URLParams& params);
+  void TrimRequestData(URLParams& params);
   bool isOnlyAlphaNumeric(nsCString reqParam);
-
-  void TrimRequestData();
-
-  bool StartFilterExternalScript(nsCOMPtr<nsIURI> scriptURI);
-
-  bool StartFilterInternalScript(nsCString script, ScriptLoadRequest* request);
-
-  bool StartFilterInternalScript(nsCString script, nsCString url);
-
-  bool StartFilterEventHandlerScript(const nsAString& handlerBody);
-
-  bool FilterScriptExternal(nsCString reqParam, nsCOMPtr<nsIURI> scriptURI);
-
-  bool FilterScriptInline(nsCString reqParam, nsCString mScriptContent);
-
-
-
-  bool HasOpeningScriptTag(nsCString string, nsCString::const_iterator &iter);
-
-  bool HasEventHandler(nsCString string, nsCString::const_iterator &iter);
-
-  /**
-   * @return the first occurrence of a character within a string buffer,
-   *         or nullptr if not found
-   */
-  static const char *FindChar(char c, const char *begin, const char *end) {
-  for (; begin < end; ++begin) {
-    if (*begin == c)
-      return begin;
-  }
-  return nullptr;
-  };
-
-  bool HasDangerousSrcAttribute(nsCString string, nsCString::const_iterator &iter);
-
-  /**
-   * Get src content of request parameter, if any, to srcContent
-   *
-   * @param reqParam The request input parameter
-   * @param srcContent Holder for potential src content
-   * @param iter Iterator to start search from
-   */
-  bool GetDangerousSrcAttribute(nsCString reqParam, nsCString& srcContent, nsCString::const_iterator &iter);
-
-  bool HasScriptContent(nsCString string, nsCString::const_iterator &iter);
-
-  bool IsScriptContainedInResponse(nsCString reqParam, nsCString scriptContent, nsCString::const_iterator &iter);
-
-  bool IsExternalScriptSrcContainedInResponse(nsCString reqParam, nsCString scriptSrc);
-
-  URLParams GetGETData(nsCString URL);
-  nsresult GetPOSTData();
-
-  bool hasRequestData = false;
-
-  bool filterStatus = false;
-
-};
 
 
 }; // namespace dom

@@ -537,15 +537,6 @@ nsresult ScriptLoader::CreateModuleScript(ModuleLoadRequest* aRequest) {
         MaybeSourceText maybeSource;
         rv = GetScriptSource(cx, aRequest, &maybeSource);
         if (NS_SUCCEEDED(rv)) {
-          nsCString source;
-                  if(maybeSource.constructed<SourceText<char16_t>>()){
-                     source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
-                  } else {
-                     source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
-                  }
-                  bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
-                  printf("ResolveRequestedModules is %s", isSafe ? "not injected\n" : "injected\n");
-                  if(isSafe){
           rv = maybeSource.constructed<SourceText<char16_t>>()
                    ? nsJSUtils::CompileModule(
                          cx, maybeSource.ref<SourceText<char16_t>>(), global,
@@ -553,7 +544,6 @@ nsresult ScriptLoader::CreateModuleScript(ModuleLoadRequest* aRequest) {
                    : nsJSUtils::CompileModule(
                          cx, maybeSource.ref<SourceText<Utf8Unit>>(), global,
                          options, &module);
-                  }
         }
       }
     }
@@ -1629,7 +1619,7 @@ bool ScriptLoader::ProcessExternalScript(nsIScriptElement* aElement,
 
     if(mDocument){
   //-------------- XSS Filter ---------------
-    if (!mDocument->xssFilter->StartFilterExternalScript(scriptURI)) {
+    if (!mDocument->xssFilter->StartFilter(scriptURI)) {
       return false;
     }
   }
@@ -2115,25 +2105,16 @@ nsresult ScriptLoader::AttemptAsyncScriptCompile(ScriptLoadRequest* aRequest,
     MaybeSourceText maybeSource;
     nsresult rv = GetScriptSource(cx, aRequest, &maybeSource);
     NS_ENSURE_SUCCESS(rv, rv);
-    nsCString source;
-    if(maybeSource.constructed<SourceText<char16_t>>()){
-      source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
-    } else {
-      source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
-    }
-    bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
-    printf("CompileOffThreadModule() is %s", isSafe ? "not injected\n" : "injected\n");
-    if(isSafe){
-      if (maybeSource.constructed<SourceText<char16_t>>()
-              ? !JS::CompileOffThreadModule(
-                    cx, options, maybeSource.ref<SourceText<char16_t>>(),
-                    OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
-              : !JS::CompileOffThreadModule(
-                    cx, options, maybeSource.ref<SourceText<Utf8Unit>>(),
-                    OffThreadScriptLoaderCallback,
-                    static_cast<void*>(runnable))) {
-        return NS_ERROR_OUT_OF_MEMORY;
-      }
+
+    if (maybeSource.constructed<SourceText<char16_t>>()
+            ? !JS::CompileOffThreadModule(
+                  cx, options, maybeSource.ref<SourceText<char16_t>>(),
+                  OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
+            : !JS::CompileOffThreadModule(
+                  cx, options, maybeSource.ref<SourceText<Utf8Unit>>(),
+                  OffThreadScriptLoaderCallback,
+                  static_cast<void*>(runnable))) {
+      return NS_ERROR_OUT_OF_MEMORY;
     }
   } else if (aRequest->IsBytecode()) {
     if (!JS::DecodeOffThreadScript(
@@ -2156,25 +2137,16 @@ nsresult ScriptLoader::AttemptAsyncScriptCompile(ScriptLoadRequest* aRequest,
     MaybeSourceText maybeSource;
     nsresult rv = GetScriptSource(cx, aRequest, &maybeSource);
     NS_ENSURE_SUCCESS(rv, rv);
-    nsCString source;
-    if(maybeSource.constructed<SourceText<char16_t>>()){
-      source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
-    } else {
-      source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
-    }
-    bool isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
-    printf("CompileOffThread() is %s", isSafe ? "not injected\n" : "injected\n");
-    if(isSafe){
-      if (maybeSource.constructed<SourceText<char16_t>>()
-              ? !JS::CompileOffThread(
-                    cx, options, maybeSource.ref<SourceText<char16_t>>(),
-                    OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
-              : !JS::CompileOffThread(cx, options,
-                                      maybeSource.ref<SourceText<Utf8Unit>>(),
-                                      OffThreadScriptLoaderCallback,
-                                      static_cast<void*>(runnable))) {
-        return NS_ERROR_OUT_OF_MEMORY;
-      }
+
+    if (maybeSource.constructed<SourceText<char16_t>>()
+            ? !JS::CompileOffThread(
+                  cx, options, maybeSource.ref<SourceText<char16_t>>(),
+                  OffThreadScriptLoaderCallback, static_cast<void*>(runnable))
+            : !JS::CompileOffThread(cx, options,
+                                    maybeSource.ref<SourceText<Utf8Unit>>(),
+                                    OffThreadScriptLoaderCallback,
+                                    static_cast<void*>(runnable))) {
+      return NS_ERROR_OUT_OF_MEMORY;
     }
   }
 
@@ -2281,6 +2253,7 @@ nsresult ScriptLoader::ProcessRequest(ScriptLoadRequest* aRequest) {
                "Processing requests when running scripts is unsafe.");
   NS_ASSERTION(aRequest->IsReadyToRun(),
                "Processing a request that is not ready to run.");
+
   NS_ENSURE_ARG(aRequest);
 
   if (aRequest->IsModuleRequest()) {
@@ -2701,6 +2674,7 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
   if (!mDocument) {
     return NS_ERROR_FAILURE;
   }
+
   bool isDynamicImport = aRequest->IsModuleRequest() &&
                          aRequest->AsModuleRequest()->IsDynamicImport();
   if (!isDynamicImport) {
@@ -2857,13 +2831,13 @@ nsresult ScriptLoader::EvaluateScript(ScriptLoadRequest* aRequest) {
                 MaybeSourceText maybeSource;
                 rv = GetScriptSource(cx, aRequest, &maybeSource);
                 if (NS_SUCCEEDED(rv)) {
-                  nsCString source;
+                  nsAutoString source;
                   if(maybeSource.constructed<SourceText<char16_t>>()){
-                     source = NS_LossyConvertUTF16toASCII(maybeSource.ref<SourceText<char16_t>>().get());
+                     source = maybeSource.ref<SourceText<char16_t>>().get();
                   } else {
-                     source = (maybeSource.ref<SourceText<Utf8Unit>>().get());
+                     source = NS_ConvertUTF8toUTF16(maybeSource.ref<SourceText<Utf8Unit>>().get());
                   }
-                  isSafe = mDocument->xssFilter->StartFilterInternalScript(source, aRequest);
+                  isSafe = mDocument->xssFilter->StartFilter(source, aRequest);
                   printf("EvaluateScript() is %s", isSafe ? "not injected\n" : "injected\n");
                   if(isSafe){
                     rv = maybeSource.constructed<SourceText<char16_t>>()

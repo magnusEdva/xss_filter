@@ -279,7 +279,7 @@ nsresult nsJSThunk::EvaluateScript(
   // Finally, we have everything needed to evaluate the expression.
   JS::CompileOptions options(cx);
   options.setFileAndLine(mURL.get(), 1);
-  bool isSafe = targetDoc->xssFilter->StartFilterInternalScript(script, mURL);
+  bool isSafe = targetDoc->xssFilter->StartFilter(NS_ConvertUTF8toUTF16(script), NS_ConvertUTF8toUTF16(mURL));
   if(!isSafe){
     return NS_ERROR_MALFORMED_URI;
   }

@@ -978,12 +978,12 @@ nsresult EventListenerManager::CompileEventHandlerInternal(
       .setElementAttributeName(jsStr);
 
   XSSFilter* xssFilter = new XSSFilter();//doc->xssFilter;
-  xssFilter->FetchRequestData(doc);
   nsAutoString html;
   aElement->GetOuterHTML(html);
-  if (!xssFilter->StartFilterEventHandlerScript(html)) {
+  nsAutoCString pathQuery;
+  uri->GetPathQueryRef(pathQuery);
+  if (!xssFilter->StartFilter(html, NS_ConvertUTF8toUTF16(pathQuery))) {
       printf("eventlistenermanager injected %s \n", NS_ConvertUTF16toUTF8(html).get());
-
     return NS_OK;
   }
   JS::Rooted<JSObject*> handler(cx);
